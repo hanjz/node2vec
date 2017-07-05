@@ -2,13 +2,18 @@ package com.navercorp
 
 
 import java.io.Serializable
+import java.io.{BufferedWriter, File, FileWriter}
+
 import scala.util.Try
-import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 import org.slf4j.{Logger, LoggerFactory}
+import org.apache.spark.sql.hive.HiveContext
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.graphx.{EdgeTriplet, Graph, _}
-import com.navercorp.graph.{GraphOps, EdgeAttr, NodeAttr}
+import com.navercorp.graph.{EdgeAttr, GraphOps, NodeAttr}
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
 
 object Node2vec extends Serializable {
   lazy val logger: Logger = LoggerFactory.getLogger(getClass.getName);
@@ -57,6 +62,35 @@ object Node2vec extends Serializable {
       }
     }.repartition(200).cache
     
+    this
+  }
+
+  def loadHive(videoActor: RDD[String]): this.type = {
+    val bcMaxDegree = context.broadcast(config.degree)
+    val bcEdgeCreator = config.directed match {
+      case true => context.broadcast(GraphOps.createDirectedEdge)
+      case false => context.broadcast(GraphOps.createUndirectedEdge)
+    }
+
+    val inputTriplets: RDD[(Long, Long, Double)] = indexingGraphHive(videoActor)
+
+    indexedNodes = inputTriplets.flatMap { case (srcId, dstId, weight) =>
+      bcEdgeCreator.value.apply(srcId, dstId, weight)
+    }.reduceByKey(_++_).map { case (nodeId, neighbors: Array[(VertexId, Double)]) =>
+      var neighbors_ = neighbors
+      if (neighbors_.length > bcMaxDegree.value) {
+        neighbors_ = neighbors.sortWith{ case (left, right) => left._2 > right._2 }.slice(0, bcMaxDegree.value)
+      }
+
+      (nodeId, NodeAttr(neighbors = neighbors_.distinct))
+    }.repartition(200).cache
+
+    indexedEdges = indexedNodes.flatMap { case (srcId, clickNode) =>
+      clickNode.neighbors.map { case (dstId, weight) =>
+        Edge(srcId, dstId, EdgeAttr())
+      }
+    }.repartition(200).cache
+
     this
   }
   
@@ -153,17 +187,32 @@ object Node2vec extends Serializable {
         .saveVectors()
   }
   
-  def saveRandomPath(): this.type = {
-    randomWalkPaths
-            .map { case (vertexId, pathBuffer) =>
-              Try(pathBuffer.mkString("\t")).getOrElse(null)
-            }
-            .filter(x => x != null && x.replaceAll("\\s", "").length > 0)
-            .repartition(200)
-            .saveAsTextFile(config.output)
-    
-    this
-  }
+//  def saveRandomPath(): this.type = {
+//    randomWalkPaths
+//            .map { case (vertexId, pathBuffer) =>
+//              Try(pathBuffer.mkString("\t")).getOrElse(null)
+//            }
+//            .filter(x => x != null && x.replaceAll("\\s", "").length > 0)
+//            .repartition(200)
+//            .saveAsTextFile(config.output)
+//
+//    this
+//  }
+def saveRandomPath(): this.type = {
+  val file = new File("/home/han/git/node2vec/output.txt")
+  val bw = new BufferedWriter(new FileWriter(file))
+
+  randomWalkPaths
+    .map { case (vertexId, pathBuffer) =>
+      Try(pathBuffer.mkString("\t")).getOrElse(null)
+    }
+    .filter(x => x != null && x.replaceAll("\\s", "").length > 0)
+    .repartition(200).collect().foreach( text => bw.write(s"$text\n"))
+
+  bw.close()
+
+  this
+}
   
   def saveModel(): this.type = {
     Word2vec.save(config.output)
@@ -242,6 +291,39 @@ object Node2vec extends Serializable {
       (parts.head.toLong, parts(1).toLong, weight)
     }
   }
+
+  def readHiveTable(hivecontext: HiveContext): RDD[String] ={
+
+    val videoActorSchema = StructType(Array(
+      StructField("video_id", StringType, true),
+      StructField("artists", StringType, true)
+    ))
+
+    var videoRows = new ListBuffer[Row]()
+
+    videoRows += Row("100", "4976: Jack, 6167: Kate")
+    videoRows += Row("101", "4976: Jack, 6167: Kate")
+    videoRows += Row("102", "4975: Tom, 6167: Kate")
+
+    val videos = hivecontext.createDataFrame(hivecontext.sparkContext.parallelize(videoRows), videoActorSchema)
+
+    hivecontext.sql("CREATE TABLE IF NOT EXISTS videoActor (video_id varchar(128), artists string)")
+
+    videos.write.mode("overwrite").saveAsTable("videoActor")
+
+    val videoActorTable =  hivecontext.sql(s"SELECT video_id, artists FROM videoActor")
+
+//    videoActorTable.show()
+    videoActorTable.flatMap{
+      row => {
+        val videoID = row(0).asInstanceOf[String]
+        val video_artists = row(1).asInstanceOf[String].
+          trim().split(",").
+          map{ s => s"$videoID  ${s.trim().split(":")(0)}"}
+        video_artists
+      }
+    }
+  }
   
 
   def indexingGraph(rawTripletPath: String): RDD[(Long, Long, Double)] = {
@@ -273,6 +355,37 @@ object Node2vec extends Serializable {
       }
     }.filter(_!=null)
   }
+
+
+  def indexingGraphHive(rawTriplet: RDD[String]): RDD[(Long, Long, Double)] = {
+    val rawEdges = rawTriplet.map { triplet =>
+      val parts = triplet.split("\\s")
+      Try {
+        (parts.head, parts(1), Try(parts.last.toDouble).getOrElse(1.0))
+      }.getOrElse(null)
+    }.filter(_!=null)
+
+    this.node2id = createNode2Id(rawEdges)
+
+    rawEdges.map { case (src, dst, weight) =>
+      (src, (dst, weight))
+    }.join(node2id).map { case (src, (edge: (String, Double), srcIndex: Long)) =>
+      try {
+        val (dst: String, weight: Double) = edge
+        (dst, (srcIndex, weight))
+      } catch {
+        case e: Exception => null
+      }
+    }.filter(_!=null).join(node2id).map { case (dst, (edge: (Long, Double), dstIndex: Long)) =>
+      try {
+        val (srcIndex, weight) = edge
+        (srcIndex, dstIndex, weight)
+      } catch {
+        case e: Exception => null
+      }
+    }.filter(_!=null)
+  }
+
   
   def createNode2Id[T <: Any](triplets: RDD[(String, String, T)]) = triplets.flatMap { case (src, dst, weight) =>
     Try(Array(src, dst)).getOrElse(Array.empty[String])

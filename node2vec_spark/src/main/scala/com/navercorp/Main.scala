@@ -1,9 +1,12 @@
 package com.navercorp
 
 import java.io.Serializable
-import org.apache.spark.{SparkContext, SparkConf}
+
+import org.apache.spark.{SparkConf, SparkContext}
 import scopt.OptionParser
 import com.navercorp.lib.AbstractParams
+import org.apache.spark.sql.hive.HiveContext
+import org.apache.spark.sql.hive.test.TestHive
 
 object Main {
   object Command extends Enumeration {
@@ -90,19 +93,27 @@ object Main {
   }
   
   def main(args: Array[String]) = {
+
     parser.parse(args, defaultParams).map { param =>
-      val conf = new SparkConf().setAppName("Node2Vec")
-      val context: SparkContext = new SparkContext(conf)
-      
+//      val conf = new SparkConf().setAppName("Node2Vec")
+//      val context: SparkContext = new SparkContext(conf)
+
+      val context: SparkContext = TestHive.sparkContext
+      val hiveSC = new HiveContext(context)
+      val video_actor = Node2vec.readHiveTable(TestHive)
+//    Node2vec.loadHive(video_actor)
+
       Node2vec.setup(context, param)
-      
+
       param.cmd match {
-        case Command.node2vec => Node2vec.load()
+//        case Command.node2vec => Node2vec.load()
+        case Command.node2vec => Node2vec.loadHive(video_actor)
                                          .initTransitionProb()
                                          .randomWalk()
                                          .embedding()
                                          .save()
-        case Command.randomwalk => Node2vec.load()
+//        case Command.randomwalk => Node2vec.load()
+        case Command.randomwalk => Node2vec.loadHive(video_actor)
                                            .initTransitionProb()
                                            .randomWalk()
                                            .saveRandomPath()
